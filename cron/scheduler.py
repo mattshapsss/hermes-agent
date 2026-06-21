@@ -814,13 +814,62 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         if runtime_adapter is not None and loop is not None and getattr(loop, "is_running", lambda: False)():
             send_metadata = {"thread_id": thread_id} if thread_id else None
             try:
-                # Send cleaned text (MEDIA tags stripped) — not the raw content
+                # Send cleaned text (MEDIA tags stripped) — not the raw content.
+                # Route through the gateway's DeliveryRouter so the live send
+                # gets the same platform-specific routing as live messages —
+                # in particular Telegram's three-mode topic routing (forum
+                # supergroups via message_thread_id, Bot API DM topics via
+                # direct_messages_topic_id, and Hermes private DM-topic lanes
+                # via a reply anchor / named-topic creation).  The standalone
+                # cron path lacked this, so DM-topic cron deliveries landed in
+                # the General topic or were rejected by Bot API 10.0 (#22773).
                 text_to_send = cleaned_delivery_content.strip()
                 adapter_ok = True
                 if text_to_send:
                     from agent.async_utils import safe_schedule_threadsafe
+                    from gateway.delivery import (
+                        DeliveryRouter,
+                        DeliveryTarget,
+                        _looks_like_int,
+                        _looks_like_telegram_private_chat_id,
+                    )
+
+                    router = DeliveryRouter(config, adapters)
+                    # Telegram three-mode topic routing (#22773): a private chat
+                    # (positive chat_id) with a NUMERIC topic id is a Bot API
+                    # Direct Messages topic and must be addressed via
+                    # ``direct_messages_topic_id`` — a bare ``message_thread_id``
+                    # is rejected/mis-routed by Bot API 10.0 and lands in
+                    # General.  Forum/supergroup targets (negative chat_id) and
+                    # named DM-topic lanes keep the router's default handling
+                    # off ``target.thread_id``.
+                    route_metadata = None
+                    route_thread_id = str(thread_id) if thread_id is not None else None
+                    if (
+                        platform == Platform.TELEGRAM
+                        and thread_id is not None
+                        and _looks_like_telegram_private_chat_id(str(chat_id))
+                        and _looks_like_int(str(thread_id))
+                    ):
+                        route_metadata = {"direct_messages_topic_id": str(thread_id)}
+                        route_thread_id = None  # routed via metadata, not thread_id
+                    route_target = DeliveryTarget(
+                        platform=platform,
+                        chat_id=str(chat_id),
+                        thread_id=route_thread_id,
+                        is_explicit=True,
+                    )
+                    # Pass thread routing via the target (not a bare metadata
+                    # "thread_id"): the router only applies its Telegram DM-topic
+                    # detection when "thread_id"/"message_thread_id" are absent
+                    # from metadata, deriving the routing from target.thread_id
+                    # or the explicit direct_messages_topic_id above.
                     future = safe_schedule_threadsafe(
-                        runtime_adapter.send(chat_id, text_to_send, metadata=send_metadata),
+                        router._deliver_to_platform(
+                            route_target,
+                            text_to_send,
+                            route_metadata,
+                        ),
                         loop,
                     )
                     if future is None:

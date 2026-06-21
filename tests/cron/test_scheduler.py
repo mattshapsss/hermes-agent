@@ -625,9 +625,15 @@ class TestDeliverResultWrapping:
 
         # run_coroutine_threadsafe returns concurrent.futures.Future (has timeout kwarg)
         def fake_run_coro(coro, _loop):
+            # Actually run the routed coroutine (router._deliver_to_platform)
+            # so the underlying adapter.send is invoked, then wrap the real
+            # result in a completed Future (matching run_coroutine_threadsafe).
+            import asyncio as _asyncio
             future = Future()
-            future.set_result(MagicMock(success=True))
-            coro.close()
+            try:
+                future.set_result(_asyncio.run(coro))
+            except BaseException as _e:  # noqa: BLE001
+                future.set_exception(_e)
             return future
 
         job = {
@@ -676,9 +682,15 @@ class TestDeliverResultWrapping:
         loop.is_running.return_value = True
 
         def fake_run_coro(coro, _loop):
+            # Actually run the routed coroutine (router._deliver_to_platform)
+            # so the underlying adapter.send is invoked, then wrap the real
+            # result in a completed Future (matching run_coroutine_threadsafe).
+            import asyncio as _asyncio
             future = Future()
-            future.set_result(MagicMock(success=True))
-            coro.close()
+            try:
+                future.set_result(_asyncio.run(coro))
+            except BaseException as _e:  # noqa: BLE001
+                future.set_exception(_e)
             return future
 
         job = {
@@ -719,9 +731,15 @@ class TestDeliverResultWrapping:
         loop.is_running.return_value = True
 
         def fake_run_coro(coro, _loop):
+            # Actually run the routed coroutine (router._deliver_to_platform)
+            # so the underlying adapter.send is invoked, then wrap the real
+            # result in a completed Future (matching run_coroutine_threadsafe).
+            import asyncio as _asyncio
             future = Future()
-            future.set_result(MagicMock(success=True))
-            coro.close()
+            try:
+                future.set_result(_asyncio.run(coro))
+            except BaseException as _e:  # noqa: BLE001
+                future.set_exception(_e)
             return future
 
         job = {
@@ -763,9 +781,15 @@ class TestDeliverResultWrapping:
         loop.is_running.return_value = True
 
         def fake_run_coro(coro, _loop):
+            # Actually run the routed coroutine (router._deliver_to_platform)
+            # so the underlying adapter.send is invoked, then wrap the real
+            # result in a completed Future (matching run_coroutine_threadsafe).
+            import asyncio as _asyncio
             future = Future()
-            future.set_result(MagicMock(success=True))
-            coro.close()
+            try:
+                future.set_result(_asyncio.run(coro))
+            except BaseException as _e:  # noqa: BLE001
+                future.set_exception(_e)
             return future
 
         job = {
@@ -2773,22 +2797,19 @@ class TestDeliverResultTimeoutCancelsFuture:
         assert result is None, f"expected successful delivery, got error: {result!r}"
         standalone_send.assert_awaited_once()
 
-    def test_live_adapter_thread_fallback_records_delivery_error(self):
-        """A cron target with an explicit topic must not be marked clean if
-        Telegram falls back to the base chat after "thread not found".
+    def test_live_adapter_private_dm_topic_routes_via_direct_messages_topic_id(self):
+        """#22773: a cron target to a PRIVATE Telegram chat with a numeric topic
+        id must be routed via ``direct_messages_topic_id`` (Bot API DM topics),
+        NOT a bare ``message_thread_id`` (which Bot API 10.0 rejects / mis-routes
+        to General).  The cron live-adapter path routes through the gateway
+        DeliveryRouter, which applies the same three-mode routing as live
+        messages.
         """
         from gateway.config import Platform
         from gateway.platforms.base import SendResult
         from concurrent.futures import Future
 
-        send_result = SendResult(
-            success=True,
-            message_id="42",
-            raw_response={
-                "requested_thread_id": 7072,
-                "thread_fallback": True,
-            },
-        )
+        send_result = SendResult(success=True, message_id="42")
         adapter = MagicMock()
         adapter.send = AsyncMock(return_value=send_result)
 
@@ -2796,21 +2817,25 @@ class TestDeliverResultTimeoutCancelsFuture:
         pconfig.enabled = True
         mock_cfg = MagicMock()
         mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        # DeliveryRouter consults the silence-narration config flag.
+        mock_cfg.filter_silence_narration = False
 
         loop = MagicMock()
         loop.is_running.return_value = True
 
         job = {
-            "id": "thread-fallback-job",
-            "deliver": "telegram:226252250:7072",
+            "id": "dm-topic-job",
+            "deliver": "telegram:226252250:7072",  # private chat + numeric topic
         }
 
-        completed_future = Future()
-        completed_future.set_result(send_result)
-
         def fake_run_coro(coro, _loop):
-            coro.close()
-            return completed_future
+            import asyncio as _asyncio
+            future = Future()
+            try:
+                future.set_result(_asyncio.run(coro))
+            except BaseException as _e:  # noqa: BLE001
+                future.set_exception(_e)
+            return future
 
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
@@ -2822,15 +2847,16 @@ class TestDeliverResultTimeoutCancelsFuture:
                 loop=loop,
             )
 
-        assert result == (
-            "configured thread_id 7072 for telegram:226252250 was not found; "
-            "delivered without thread_id"
-        )
-        adapter.send.assert_called_once_with(
-            "226252250",
-            "Hello world",
-            metadata={"thread_id": "7072"},
-        )
+        assert result is None, f"expected clean delivery, got: {result!r}"
+        adapter.send.assert_called_once()
+        sent_chat_id, sent_text = adapter.send.call_args[0][0], adapter.send.call_args[0][1]
+        sent_metadata = adapter.send.call_args[1]["metadata"]
+        assert sent_chat_id == "226252250"
+        assert sent_text == "Hello world"
+        # The topic must be addressed via direct_messages_topic_id, and a bare
+        # message_thread_id must NOT be set (that is the Bot API 10.0 bug).
+        assert str(sent_metadata.get("direct_messages_topic_id")) == "7072"
+        assert not sent_metadata.get("message_thread_id")
 
 
 class TestSendMediaTimeoutCancelsFuture:
